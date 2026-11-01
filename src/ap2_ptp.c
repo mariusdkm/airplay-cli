@@ -42,6 +42,7 @@
 #include "../libraop/crosstools/src/cross_net.h"
 #include "../libraop/src/raop_client.h"
 #include "cross_log.h"
+#include "ap2_nqptp.h"
 #include "ap2_ptp.h"
 #include "ap2_ptp_peers.h"
 #include "ap2_ptp_shm.h"
@@ -151,6 +152,7 @@ struct ptp_follow {
     bool have_offset;               /* >= 1 offset sample folded in */
     uint64_t clock_id;              /* its grandmasterIdentity (timeline id) */
     int64_t offset_ns;              /* local -> its clock (add to local ns) */
+    uint64_t lock_ns;               /* local ns of its first offset sample */
     uint64_t last_ns;               /* local ns of its last Announce/Sync */
     bool pending_sync_valid;        /* two-step Sync awaiting its Follow_Up */
     uint16_t pending_sync_seq;
@@ -872,6 +874,7 @@ static bool ptp_follow_sync(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
                                   - (int64_t)f->pending_sync_rx_ns);
         locked_now = !had;
     }
+    if (locked_now) f->lock_ns = rx_ns;
     int64_t off = f->offset_ns;
     uint64_t cid = f->clock_id;
     pthread_mutex_unlock(&ctx->lock);
@@ -893,6 +896,24 @@ static bool ptp_follow_lookup(struct ap2_ptp_ctx *ctx, struct in_addr addr,
         return true;
     }
     return false;
+}
+
+bool ap2_ptp_follow_clock(struct ap2_ptp_ctx *ctx, struct in_addr addr, uint64_t *clock_id,
+                          int64_t *offset_ns, uint64_t *lock_ns)
+{
+    if (!ctx) return false;
+    bool ok = false;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < PTP_MAX_FOLLOW && !ok; i++) {
+        const struct ptp_follow *f = &ctx->follow[i];
+        if (f->addr.s_addr != addr.s_addr || !f->have_clock || !f->have_offset) continue;
+        *clock_id = f->clock_id;
+        *offset_ns = f->offset_ns;
+        *lock_ns = f->lock_ns;
+        ok = true;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return ok;
 }
 
 /* Lock held. Is `addr` a followed receiver? */
@@ -1856,42 +1877,96 @@ static void daemon_handle_ctrl(int sock, struct ap2_ptp_peers *ps, struct ptp_fo
     sendto(sock, ack, an, 0, (struct sockaddr *)&src, sl);
 }
 
-int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
+struct daemon_peers {
+    struct ap2_ptp_peers *ps;
+    struct ptp_followed *fl;
+    struct ap2_ptp_ctx *ctx;
+};
+
+/* An NQPTP client's sender is an ownerless followed registration. */
+static bool daemon_nqptp_follow(void *ud, struct in_addr ip, bool on)
+{
+    struct daemon_peers *d = ud;
+    char s[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &ip, s, sizeof(s));
+    bool ok = on ? ap2_ptp_peers_add(d->ps, s, 0, true) : ap2_ptp_peers_release(d->ps, s);
+    if (ok) peerset_apply(d->ps, d->fl, d->ctx);
+    return ok;
+}
+
+static bool daemon_nqptp_clock(void *ud, struct in_addr ip, struct ap2_nqptp_clock *out)
+{
+    struct daemon_peers *d = ud;
+    return ap2_ptp_follow_clock(d->ctx, ip, &out->clock_id, &out->offset_ns, &out->lock_ns);
+}
+
+int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id, bool nqptp_compat,
                        volatile bool *stop)
 {
+    int64_t clock_offset_ns = 0;
+    if (nqptp_compat && !host_clock_offset_ns(&clock_offset_ns)) {
+        /* clients read the raw clock */
+        LOG_ERROR("[PTP] daemon: NQPTP compatibility needs --clock-offset-ns");
+        return AP2_PTP_DAEMON_EXIT_ERROR;
+    }
+
     struct ap2_ptp_ctx *ctx = ap2_ptp_create();
-    if (!ctx) { LOG_ERROR("[PTP] daemon: cannot create context"); return 1; }
+    if (!ctx) { LOG_ERROR("[PTP] daemon: cannot create context"); return AP2_PTP_DAEMON_EXIT_ERROR; }
     if (clock_id) ap2_ptp_set_clock_id(ctx, clock_id);
+
+    struct ap2_ptp_peers ps = {0};
+    struct ptp_followed followed = {0};
+    struct daemon_peers dp = {.ps = &ps, .fl = &followed, .ctx = ctx};
+    struct ap2_nqptp nq = {.sock4 = -1, .sock6 = -1};
+    if (nqptp_compat) {
+        const struct ap2_nqptp_ops ops = {
+            .ud = &dp, .follow = daemon_nqptp_follow, .clock = daemon_nqptp_clock,
+        };
+        int err = ap2_nqptp_open(&nq, &ops, clock_offset_ns);
+        if (err) {
+            if (err == EADDRINUSE) {
+                LOG_ERROR("[PTP] daemon: UDP %d is taken, probably by nqptp; stop it or "
+                          "run without --nqptp-compat", AP2_NQPTP_CTRL_PORT);
+            } else {
+                LOG_ERROR("[PTP] daemon: cannot open the NQPTP control port: %s",
+                          strerror(err));
+            }
+            ap2_ptp_destroy(ctx);
+            return err == EADDRINUSE ? AP2_PTP_DAEMON_EXIT_NQPTP : AP2_PTP_DAEMON_EXIT_ERROR;
+        }
+    }
 
     struct ap2_ptp_shm_writer w;
     if (!ap2_ptp_shm_writer_open(&w)) {
+        ap2_nqptp_close(&nq);
         ap2_ptp_destroy(ctx);
-        return 1;
+        return AP2_PTP_DAEMON_EXIT_ERROR;
     }
 
     int ctrl = ap2_ptp_ctrl_server_open();
     if (ctrl < 0) {
         LOG_ERROR("[PTP] daemon: control channel unavailable (another daemon running?)");
+        ap2_nqptp_close(&nq);
         ap2_ptp_shm_writer_close(&w);
         ap2_ptp_destroy(ctx);
-        return 1;
+        return AP2_PTP_DAEMON_EXIT_ERROR;
     }
 
     if (!ap2_ptp_engine_start(ctx, bind_addr, NULL)) {
         LOG_ERROR("[PTP] daemon: cannot bind UDP 319/320 (run as root / grant "
                   "CAP_NET_BIND_SERVICE). Multi-room PTP sync is unavailable.");
         close(ctrl);
+        ap2_nqptp_close(&nq);
         ap2_ptp_shm_writer_close(&w);
         ap2_ptp_destroy(ctx);
-        return 2;
+        return AP2_PTP_DAEMON_EXIT_PTP;
     }
 
     uint64_t start_ns = ap2_ptp_now_ns(ctx);
-    struct ap2_ptp_peers ps = {0};
-    struct ptp_followed followed = {0};
     uint64_t next_reap_ns = daemon_monotonic_ns() + PTP_DAEMON_REAP_NS;
-    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d",
-             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT);
+    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d, nqptp=%s",
+             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT,
+             nqptp_compat ? "on" : "off");
 
     /* Publish immediately so an early-attaching stream sees a live sample. */
     struct ap2_ptp_shm_sample sample;
@@ -1899,10 +1974,16 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
     ap2_ptp_shm_publish(&w, sample);
 
     while (!*stop) {
-        struct pollfd pfd = {.fd = ctrl, .events = POLLIN};
-        int pr = poll(&pfd, 1, 100);   /* ~10 Hz publish cadence */
-        if (pr > 0 && (pfd.revents & POLLIN))
+        struct pollfd pfd[3] = {
+            {.fd = ctrl, .events = POLLIN},
+            {.fd = nq.sock4, .events = POLLIN},   /* poll() skips fd -1 */
+            {.fd = nq.sock6, .events = POLLIN},
+        };
+        int pr = poll(pfd, 3, 100);   /* ~10 Hz publish cadence */
+        if (pr > 0 && (pfd[0].revents & POLLIN))
             daemon_handle_ctrl(ctrl, &ps, &followed, ctx);
+        for (int i = 1; pr > 0 && i < 3; i++)
+            if (pfd[i].revents & POLLIN) ap2_nqptp_receive(&nq, pfd[i].fd, ap2_ptp_now_ns(ctx));
         uint64_t now = daemon_monotonic_ns();
         if (now >= next_reap_ns) {
             next_reap_ns = now + PTP_DAEMON_REAP_NS;
@@ -1911,9 +1992,11 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
         }
         daemon_fill_sample(ctx, start_ns, &sample);
         ap2_ptp_shm_publish(&w, sample);
+        if (nqptp_compat) ap2_nqptp_tick(&nq, ap2_ptp_now_ns(ctx));
     }
 
     LOG_INFO("[PTP] daemon shutting down");
+    ap2_nqptp_close(&nq);
     close(ctrl);
     ap2_ptp_shm_writer_close(&w);
     ap2_ptp_destroy(ctx);

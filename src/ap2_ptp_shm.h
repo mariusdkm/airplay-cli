@@ -183,7 +183,7 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
  * NOTE: nqptp's "T" REPLACES its peer list; ours ADDS, because each streaming
  * process registers its own receiver independently and the daemon aggregates
  * them. Use R/U for the explicit refcounted add/remove; T is only for tools
- * that speak nqptp's vocabulary.
+ * that speak nqptp's vocabulary. shairport-sync is served by ap2_nqptp.h.
  */
 
 /* Open the daemon-side control socket (localhost UDP, bound to AP2_PTP_CTRL_PORT).

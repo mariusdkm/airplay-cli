@@ -2064,7 +2064,7 @@ static void ptp_daemon_signal_handler(int sig)
 
 /* Run `cliairplay --ptp-daemon`: own UDP 319/320, run the shared PTP clock, and
  * serve the control channel until signaled. Returns the process exit code. */
-static int run_ptp_daemon(cli_config_t *cfg)
+static int run_ptp_daemon(cli_config_t *cfg, bool nqptp_compat)
 {
     struct in_addr bind_addr;
     bind_addr.s_addr = INADDR_ANY;
@@ -2091,7 +2091,8 @@ static int run_ptp_daemon(cli_config_t *cfg)
         clock_id = 0;
     }
 
-    return ap2_ptp_run_daemon(bind_addr, (uint64_t)clock_id, &g_ptp_daemon_stop);
+    return ap2_ptp_run_daemon(bind_addr, (uint64_t)clock_id, nqptp_compat,
+                              &g_ptp_daemon_stop);
 }
 
 /* ---- Usage ---- */
@@ -2171,7 +2172,10 @@ static void print_usage(const char *name)
     printf("  --ptp-daemon               Run ONLY the shared PTP clock: bind 319/320 once,\n");
     printf("                             publish the elected master to shared memory, and\n");
     printf("                             serve the control channel until signaled. One per\n");
-    printf("                             host; needs root. Takes no host/audio args.\n\n");
+    printf("                             host; needs root. Takes no host/audio args.\n");
+    printf("  --nqptp-compat             With --ptp-daemon: stand in for nqptp so a local\n");
+    printf("                             shairport-sync receives AirPlay 2. Needs\n");
+    printf("                             --clock-offset-ns; exits 3 if UDP 9000 is taken.\n\n");
     printf("Examples:\n");
     printf("  # RAOP command-only session:\n");
     printf("  %s --protocol raop --cmdpipe /tmp/raop-cap 192.168.1.50\n\n", name);
@@ -2205,6 +2209,7 @@ int main(int argc, char *argv[])
 
     bool pairing_mode = false;
     bool ptp_daemon_mode = false;
+    bool nqptp_compat = false;
     bool pair_setup_mode = false;
 
     static struct option long_options[] = {
@@ -2246,6 +2251,7 @@ int main(int argc, char *argv[])
         {"pair",         no_argument,       0, 1003},
         {"pair-setup",   no_argument,       0, 1013},
         {"clock-offset-ns", required_argument, 0, 1015},
+        {"nqptp-compat", no_argument,       0, 1016},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2303,6 +2309,7 @@ int main(int argc, char *argv[])
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
+        case 1016: nqptp_compat = true; break;
         case 1015: {
             char *end = NULL;
             errno = 0;
@@ -2375,7 +2382,7 @@ int main(int argc, char *argv[])
     /* PTP daemon mode: no host; run the shared clock until signaled.
      * MA starts one of these per host for multi-room AirPlay 2 (see README). */
     if (ptp_daemon_mode) {
-        int rc = run_ptp_daemon(&cfg);
+        int rc = run_ptp_daemon(&cfg, nqptp_compat);
         netsock_close();
         cross_ssl_free();
         return rc;

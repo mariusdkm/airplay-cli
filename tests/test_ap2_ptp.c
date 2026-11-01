@@ -14,9 +14,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "ap2_nqptp.h"
 #include "ap2_ptp.h"
 #include "ap2_ptp_shm.h"
 #include "cross_log.h"
+#include "host_clock.h"
 
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
@@ -173,11 +175,12 @@ static void test_engine_start_serves_device_before_setpeers(void)
 /* ---- shared daemon (--ptp-daemon) driven over its control channel ---- */
 
 static volatile bool daemon_stop_flag;
+static bool daemon_nqptp;
 
 static void *daemon_thread(void *arg)
 {
     (void)arg;
-    ap2_ptp_run_daemon(any_iface(), 0, &daemon_stop_flag);
+    ap2_ptp_run_daemon(any_iface(), 0, daemon_nqptp, &daemon_stop_flag);
     return NULL;
 }
 
@@ -311,6 +314,85 @@ static void test_daemon_replaces_stale_smaller_shm(void)
     daemon_stop(t);
 }
 
+/* ---- NQPTP compatibility (--nqptp-compat) ---- */
+
+#define NQ_NAME "/cliairplay-nq-test"
+
+static void nqptp_send(const char *msg)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(AP2_NQPTP_CTRL_PORT)};
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    /* With the NUL, as shairport-sync sends it. */
+    assert(sendto(s, msg, strlen(msg) + 1, 0, (struct sockaddr *)&to, sizeof(to)) > 0);
+    close(s);
+}
+
+/* nqptp clients read the raw clock, which a realtime host clock cannot be
+ * converted to. */
+static void test_daemon_nqptp_needs_the_raw_clock(void)
+{
+    int64_t off;
+    if (host_clock_offset_ns(&off)) return;   /* another test set it first */
+    volatile bool stop = true;
+    assert(ap2_ptp_run_daemon(any_iface(), 0, true, &stop) == AP2_PTP_DAEMON_EXIT_ERROR);
+}
+
+/* A real nqptp holding the control port is reported with its own exit code,
+ * so the server can tell it apart and fall back. */
+static void test_daemon_nqptp_port_taken(void)
+{
+    host_clock_set_offset_ns(0);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(AP2_NQPTP_CTRL_PORT)};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(s, (struct sockaddr *)&a, sizeof(a)) == 0);
+    volatile bool stop = true;
+    assert(ap2_ptp_run_daemon(any_iface(), 0, true, &stop) == AP2_PTP_DAEMON_EXIT_NQPTP);
+    close(s);
+}
+
+/* shairport-sync's startup: a bare "T", then it needs a readable version-11
+ * clock within 0.5 s. Naming a sender then makes it a followed timing peer,
+ * which the daemon never sends its own grandmaster timing to. */
+static void test_daemon_nqptp_serves_shairport_sync(void)
+{
+    host_clock_set_offset_ns(0);
+    shm_unlink(NQ_NAME);
+    daemon_nqptp = true;
+    pthread_t t = daemon_start();
+
+    nqptp_send(NQ_NAME " T");
+    int fd = -1;
+    for (int waited = 0; fd < 0 && waited < 500; waited += 10) {
+        fd = shm_open(NQ_NAME, O_RDONLY, 0);
+        if (fd < 0) usleep(10000);
+    }
+    assert(fd >= 0);
+    struct ap2_nqptp_smi *smi = mmap(NULL, sizeof(*smi), PROT_READ, MAP_SHARED, fd, 0);
+    assert(smi != MAP_FAILED);
+    close(fd);
+    assert(smi->version == AP2_NQPTP_SMI_VERSION);
+    assert(smi->main.master_clock_id == 0);
+
+    /* The sender is followed, so our grandmaster is not offered to it, while
+     * a stream's receiver is still served. */
+    nqptp_send(NQ_NAME " T 192.0.2.60");
+    nqptp_send(NQ_NAME " B");
+    ctrl("R 192.0.2.61 pid=%d", (int)getpid());
+    assert(wait_for_sends_to("192.0.2.61", 2000));
+    assert_silent_to("192.0.2.60", 600);
+    /* No Sync from the sender yet: still no clock. */
+    assert(smi->main.master_clock_id == 0);
+
+    daemon_stop(t);
+    daemon_nqptp = false;
+    /* Left for its holder, saying there is no clock. */
+    assert(smi->version == AP2_NQPTP_SMI_VERSION && smi->main.master_clock_id == 0);
+    munmap(smi, sizeof(*smi));
+    shm_unlink(NQ_NAME);
+}
+
 struct named_test { const char *name; void (*fn)(void); };
 
 int main(int argc, char **argv)
@@ -324,6 +406,9 @@ int main(int argc, char **argv)
         {"daemon_serves_nine_receivers_at_once", test_daemon_serves_nine_receivers_at_once},
         {"daemon_reaps_receivers_of_dead_clients", test_daemon_reaps_receivers_of_dead_clients},
         {"daemon_replaces_stale_smaller_shm", test_daemon_replaces_stale_smaller_shm},
+        {"daemon_nqptp_needs_the_raw_clock", test_daemon_nqptp_needs_the_raw_clock},
+        {"daemon_nqptp_port_taken", test_daemon_nqptp_port_taken},
+        {"daemon_nqptp_serves_shairport_sync", test_daemon_nqptp_serves_shairport_sync},
     };
     /* An optional argument runs one test by name. */
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

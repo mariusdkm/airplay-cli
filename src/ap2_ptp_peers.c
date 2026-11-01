@@ -55,6 +55,18 @@ bool ap2_ptp_peers_remove(struct ap2_ptp_peers *p, const char *ip, pid_t owner)
     return true;
 }
 
+bool ap2_ptp_peers_release(struct ap2_ptp_peers *p, const char *ip)
+{
+    struct in_addr addr;
+    if (!ip || inet_pton(AF_INET, ip, &addr) != 1) return false;
+    for (int i = peers_find(p, addr, 0); i >= 0; i = peers_find(p, addr, i + 1)) {
+        if (p->e[i].owner) continue;
+        if (--p->e[i].refs == 0) peers_drop(p, i);
+        return true;
+    }
+    return false;
+}
+
 int ap2_ptp_peers_reap(struct ap2_ptp_peers *p, bool (*alive)(pid_t pid),
                        void (*on_reap)(const struct ap2_ptp_peer_reg *reg))
 {

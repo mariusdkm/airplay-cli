@@ -252,8 +252,9 @@ grandmaster — but MA spawns one cliairplay per device. The split
   once (privileged: root or `CAP_NET_BIND_SERVICE`; exits with code 2 when it
   cannot bind), publishes the elected clock to POSIX shm `/cliairplay-ptp`
   and serves the control channel until SIGINT/SIGTERM. The shm sample carries
-  the master clock ID and the local→master offset on the shared
-  CLOCK_REALTIME timebase, in a version-stamped, lock-free double buffer
+  the master clock ID and the local→master offset on the shared host clock
+  (`host_clock.h`: the raw monotonic clock plus `--clock-offset-ns`, or
+  CLOCK_REALTIME without it), in a version-stamped, lock-free double buffer
   (writer fills `main`, barrier, copies to `secondary`; readers accept a
   snapshot only when both halves match byte-for-byte).
 - **Control channel** — localhost UDP `127.0.0.1:9010` (deliberately not
@@ -262,7 +263,8 @@ grandmaster — but MA spawns one cliairplay per device. The split
   probe, `Q <ip>` query the receiver's clock-exchange streak (§6, clock
   readiness); nqptp's `T`/`B`/`E`/`P` are accepted, with `T` treated as an
   additive register (each stream registers its own receiver; the daemon
-  aggregates). Registrations carry the stream's pid (`pid=<n>`) and the
+  aggregates). This is not nqptp's interface: shairport-sync's messages
+  start with its interface name and are served on 9000 instead (§5a). Registrations carry the stream's pid (`pid=<n>`) and the
   daemon drops them once that pid is gone, so a stream the server kills
   without a clean teardown does not keep its receiver in the peer set; freed
   slots are reused.
@@ -292,9 +294,33 @@ grandmaster — but MA spawns one cliairplay per device. The split
   stream picks the entry for its own registered receiver, so
   `ap2_ptp_master_clock_id()`/`ap2_ptp_master_now_ns()` and with them the
   realtime sync packets and the START anchor (shifted from host
-  CLOCK_REALTIME into the followed timeline) are per receiver. The session
+  host clock into the followed timeline) are per receiver. The session
   SETUP still names our clock (the receiver has not announced yet); measured
   not to matter. A followed clock silent for 60 s is dropped.
+
+## 5a. NQPTP compatibility (`--nqptp-compat`)
+
+shairport-sync follows its sender's clock through nqptp, which needs 319/320
+too. With `--nqptp-compat` the daemon serves nqptp's client interface itself
+(`ap2_nqptp.c`, SMI version 11). Off by default.
+
+- **Interface**: `"<smi> T [<ip> ...]"` / `B` / `E` / `P` datagrams to
+  `localhost:9000` (v4 and v6); the clock is the 88-byte shm object `<smi>`
+  (`version` at +0, `main` at +8, `secondary` at +48), created on first use.
+- **Following**: `T <ip>` adds an ownerless followed registration for the
+  first ip, so the engine follows it like a §5 followed receiver and never
+  serves it our grandmaster. It is released after 2.25 s stopped (`E`), since
+  a Mac may also be one of our speakers; `B` re-follows. IPv6 senders read
+  "no clock".
+- **Clock domain**: clients read the raw clock, the engine runs on host clock =
+  raw + `--clock-offset-ns` (required). `ap2_nqptp_to_client_clock()` subtracts
+  it from times and adds it to the offset. `master_clock_start_time` is the
+  first offset sample of the current grandmaster; `clock_change_offset` is
+  old − new offset, per client.
+- **Lifecycle**: clients map their object once, so an existing object is
+  reused, never replaced, and is left in place ("no clock") on exit. New
+  objects are renamed into place, never visible before full size.
+- **Exit code 3**: UDP 9000 is taken (a real nqptp).
 
 ## 6. Timing and the start contract
 
