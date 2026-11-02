@@ -56,13 +56,56 @@ static void test_drift_is_followed_both_ways(void)
     assert(run(&o, &now, 400, 0, -6250, on_time) == 0);
 }
 
-static void test_step_forward_is_taken_at_once(void)
+static void test_step_forward_is_taken_on_the_second_sample(void)
 {
     struct ap2_ptp_offset o = {0};
     uint64_t now = 1000 * MS;
     run(&o, &now, 10, 0, 0, on_time);
     ap2_ptp_offset_fold(&o, 300 * MS, now);
+    assert(o.ns == 0);
+    now += SYNC_INTERVAL_NS;
+    /* the confirming Sync was a beacon late: the lower of the two is taken */
+    ap2_ptp_offset_fold(&o, 280 * MS, now);
+    assert(o.ns == 280 * MS);
+    /* and the rest of the way once two more Syncs agree */
+    for (int i = 0; i < 2; i++) {
+        now += SYNC_INTERVAL_NS;
+        ap2_ptp_offset_fold(&o, 300 * MS, now);
+    }
     assert(o.ns == 300 * MS);
+}
+
+static void test_one_high_outlier_is_ignored(void)
+{
+    struct ap2_ptp_offset o = {0};
+    uint64_t now = 1000 * MS;
+    run(&o, &now, 10, 0, 0, on_time);
+    /* a bad correction field reads 10 ms high once */
+    ap2_ptp_offset_fold(&o, 10 * MS, now);
+    now += SYNC_INTERVAL_NS;
+    assert(run(&o, &now, 40, 0, 0, on_time) == 0);
+    /* nor does it pair up with a later outlier once its window has passed */
+    ap2_ptp_offset_fold(&o, 10 * MS, now);
+    assert(o.ns == 0);
+}
+
+static void test_small_step_back_is_followed_at_the_drift_rate(void)
+{
+    struct ap2_ptp_offset o = {0};
+    uint64_t now = 1000 * MS;
+    run(&o, &now, 10, 0, 0, on_time);
+    /* below AP2_PTP_OFFSET_STEP_NS, a step back can't be told from late Syncs */
+    run(&o, &now, 80, -5 * MS, 0, on_time);
+    int64_t expected = -(80 * SYNC_INTERVAL_NS / 1000 * AP2_PTP_OFFSET_MAX_DRIFT_PPM / 1000);
+    assert(o.ns == expected);
+    int syncs = 0;
+    while (o.ns > -5 * MS) {
+        ap2_ptp_offset_fold(&o, -5 * MS, now);
+        now += SYNC_INTERVAL_NS;
+        syncs++;
+    }
+    assert(o.ns == -5 * MS);
+    printf("  5 ms step back: settled after %.1f s\n", (80 + syncs) * SYNC_INTERVAL_NS / 1e9);
 }
 
 static void test_step_back_is_taken_once_it_persists(void)
@@ -94,7 +137,9 @@ int main(void)
 {
     test_late_syncs_do_not_move_the_estimate();
     test_drift_is_followed_both_ways();
-    test_step_forward_is_taken_at_once();
+    test_step_forward_is_taken_on_the_second_sample();
+    test_one_high_outlier_is_ignored();
+    test_small_step_back_is_followed_at_the_drift_rate();
     test_step_back_is_taken_once_it_persists();
     test_restart_takes_the_first_sample();
     printf("test_ap2_ptp_offset: all tests passed\n");
