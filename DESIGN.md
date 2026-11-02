@@ -235,8 +235,10 @@ authority. The engine (`ap2_ptp.c`) implements:
 - **Delay_Resp** (E2E, used by Sonos) and **Pdelay_Resp + Follow_Up** (peer
   delay) responders, unicast to the requester.
 - **Hold-grandmaster** — full BMCA and slave machinery exist (announce
-  parsing, dataset comparison, EMA-smoothed offset tracking with a 1 ms snap,
-  3 s peer-silence reversion), but by default the engine records a competing
+  parsing, dataset comparison, offset tracking (`ap2_ptp_offset.c`, shared
+  with followed receivers: it follows the least delayed Syncs, since over
+  Wi-Fi a Sync is often tens of ms late), 3 s peer-silence reversion), but by
+  default the engine records a competing
   Announce without surrendering the timeline. Receivers only follow masters
   from the SETPEERS timing-peer list — i.e. us — so giving up the timeline
   mutes them. The BMCA/slave path remains for diagnostics and the synthetic
