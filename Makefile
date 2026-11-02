@@ -126,7 +126,7 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_peers.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_session.c
+AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_nqptp.c ap2_ptp.c ap2_ptp_peers.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_session.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
@@ -318,17 +318,18 @@ $(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
 
 # ap2_ptp.c binds ephemeral ports and records datagrams instead of sending them.
 # The daemon under test publishes and listens on its own shm object and control
-# port, so a real daemon on the machine is neither touched nor reached.
-PTP_TEST_DEFINES = -DAP2_PTP_SHM_NAME='"/cliairplay-ptp-test"' -DAP2_PTP_CTRL_PORT=9011
+# ports, so a real daemon (or nqptp) on the machine is neither touched nor reached.
+PTP_TEST_DEFINES = -DAP2_PTP_SHM_NAME='"/cliairplay-ptp-test"' -DAP2_PTP_CTRL_PORT=9011 \
+	-DAP2_NQPTP_CTRL_PORT=9012
 $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_peers.c \
-		src/ap2_ptp_peers.h src/ap2_ptp_shm.c src/ap2_ptp_shm.h src/host_clock.c \
-		src/host_clock.h Makefile
+		src/ap2_ptp_peers.h src/ap2_ptp_shm.c src/ap2_ptp_shm.h src/ap2_nqptp.c \
+		src/ap2_nqptp.h src/host_clock.c src/host_clock.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(PTP_TEST_DEFINES) -Dbind=ap2_ptp_test_bind \
 		-Dsendto=ap2_ptp_test_sendto -c src/ap2_ptp.c -o build/tests/ap2_ptp_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) $(PTP_TEST_DEFINES) tests/test_ap2_ptp.c \
-		build/tests/ap2_ptp_test.o src/ap2_ptp_peers.c src/ap2_ptp_shm.c src/host_clock.c \
-		$(TOOLS)/cross_log.c $(LDFLAGS) -o $@
+		build/tests/ap2_ptp_test.o src/ap2_ptp_peers.c src/ap2_ptp_shm.c src/ap2_nqptp.c \
+		src/host_clock.c $(TOOLS)/cross_log.c $(LDFLAGS) -o $@
 
 $(NQPTP_TEST): tests/test_ap2_nqptp.c src/ap2_nqptp.c src/ap2_nqptp.h Makefile
 	@mkdir -p $(dir $@)

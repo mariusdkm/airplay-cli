@@ -65,6 +65,14 @@ bool ap2_ptp_peers_add(struct ap2_ptp_peers *p, const char *ip, pid_t owner, boo
 bool ap2_ptp_peers_remove(struct ap2_ptp_peers *p, const char *ip, pid_t owner);
 
 /*
+ * Release one ownerless registration of `ip`. Unlike ap2_ptp_peers_remove it
+ * never falls back to one with an owner.
+ *
+ * :returns: true if one was released.
+ */
+bool ap2_ptp_peers_release(struct ap2_ptp_peers *p, const char *ip);
+
+/*
  * Remove every registration whose owner is no longer alive. Registrations
  * without an owner are kept.
  *

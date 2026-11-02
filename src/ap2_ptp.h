@@ -187,6 +187,15 @@ void ap2_ptp_unfollow_receiver(struct ap2_ptp_ctx *ctx, const char *ip);
 void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip);
 
 /*
+ * The followed clock of addr (a receiver, or an NQPTP client's sender).
+ *
+ * :param lock_ns: host ns of its first offset sample; reset on a grandmaster change.
+ * :returns: false when addr is not followed or has no offset yet.
+ */
+bool ap2_ptp_follow_clock(struct ap2_ptp_ctx *ctx, struct in_addr addr, uint64_t *clock_id,
+                          int64_t *offset_ns, uint64_t *lock_ns);
+
+/*
  * Ask the daemon to send timing to the current peer set immediately, instead
  * of waiting out the announce/sync intervals. Called right after SETPEERS so
  * a freshly registered receiver starts measuring the clock without delay.
@@ -200,12 +209,18 @@ void ap2_ptp_shared_kick(struct ap2_ptp_ctx *ctx);
  * channel (streams register their receiver IPs). Blocks until *stop becomes
  * true (set from a signal handler). This is the body of `--ptp-daemon`.
  *
+ * nqptp_compat also serves nqptp's client interface (ap2_nqptp.h).
+ *
  * :param bind_addr: multicast join interface (INADDR_ANY for default).
  * :param clock_id: grandmaster identity to advertise; 0 keeps the default.
+ * :param nqptp_compat: needs the raw host clock (host_clock_set_offset_ns).
  * :param stop: pointer to a flag polled for shutdown.
- * :returns: 0 on clean shutdown; non-zero if the engine could not bind 319/320.
+ * :returns: 0 on clean shutdown; AP2_PTP_DAEMON_EXIT_* otherwise.
  */
-int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
+#define AP2_PTP_DAEMON_EXIT_ERROR   1
+#define AP2_PTP_DAEMON_EXIT_PTP     2   /* UDP 319/320 unavailable */
+#define AP2_PTP_DAEMON_EXIT_NQPTP   3   /* UDP 9000 taken, e.g. by nqptp */
+int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id, bool nqptp_compat,
                        volatile bool *stop);
 
 #endif /* __AP2_PTP_H_ */

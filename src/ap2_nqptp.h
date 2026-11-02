@@ -2,14 +2,15 @@
  * AirPlay 2 PTP - NQPTP compatibility for the PTP daemon
  *
  * shairport-sync gets its sender's clock from nqptp, which needs UDP 319/320
- * like the daemon. The daemon can serve nqptp's client interface (SMI
- * version 11) itself:
+ * like the daemon. With --nqptp-compat the daemon serves nqptp's client
+ * interface (SMI version 11) itself:
  *
  *   control  "<smi> T [<ip> ...]", "<smi> B|E|P" to localhost:9000, no reply.
  *            T follows the first ip (none: nothing), B play, E stop, P pause.
  *   clock    shm object <smi> (struct ap2_nqptp_smi), created on first use.
  *
  * The clocks come from the owner (struct ap2_nqptp_ops).
+ *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * SPDX-License-Identifier: Apache-2.0
  */

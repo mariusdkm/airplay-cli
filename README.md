@@ -157,6 +157,9 @@ sudo setcap cap_net_bind_service=+ep /path/to/cliairplay
 cliairplay --protocol airplay2 --ptp --ptp-shared --cmdpipe /tmp/cap1 ... <ip1>
 cliairplay --protocol airplay2 --ptp --ptp-shared --cmdpipe /tmp/cap2 ... <ip2>
 
+# To also receive AirPlay 2 with a local shairport-sync, instead of nqptp:
+cliairplay --ptp-daemon --nqptp-compat --clock-offset-ns 0 &
+
 # Wait until both report [STATUS] audio, then send the same start to both:
 # START_UNIX_MS=<T>
 # ACTION=START
@@ -233,6 +236,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--pair` | Legacy Apple TV RAOP pairing; produces the `--secret` for the RAOP flow. |
 | `--pair-setup` | HomeKit pair-setup against `<host_ip>` (with `--port` and `--dacp`): the device shows a PIN, and on success the `--auth` credentials are printed on stdout. Stream later with the same `--dacp`. |
 | `--ptp-daemon` | Run **only** the shared PTP clock: bind UDP 319/320 once, run the engine, publish the elected master to shared memory, serve the control channel until SIGINT/SIGTERM. One per host; needs privilege. Honors `--if`; takes no host/audio args. |
+| `--nqptp-compat` | With `--ptp-daemon`: stand in for [nqptp](https://github.com/mikebrady/nqptp) (which would need 319/320 too), so a shairport-sync on this host receives AirPlay 2. Needs `--clock-offset-ns`. Exits 3 when UDP 9000 is taken; the readiness line ends in `nqptp=on`. |
 
 ### Runtime commands (`--cmdpipe`)
 
