@@ -104,6 +104,27 @@ static void test_follow_is_set_while_any_registration_follows(void)
     assert(snapshot(&p, ips, follow) == 1 && !follow[0]);
 }
 
+/* An NQPTP client's sender is an ownerless registration; releasing it never
+ * takes a stream's registration of the same address with it. */
+static void test_release_only_touches_ownerless_registrations(void)
+{
+    struct ap2_ptp_peers p = {0};
+    const char *ips[AP2_PTP_MAX_PEERS];
+    bool follow[AP2_PTP_MAX_PEERS];
+    assert(ap2_ptp_peers_add(&p, "192.0.2.1", 7, false));
+    assert(!ap2_ptp_peers_release(&p, "192.0.2.1"));
+    assert(snapshot(&p, ips, follow) == 1);
+
+    assert(ap2_ptp_peers_add(&p, "192.0.2.1", 0, true));
+    assert(ap2_ptp_peers_add(&p, "192.0.2.1", 0, true));
+    assert(ap2_ptp_peers_release(&p, "192.0.2.1"));
+    assert(snapshot(&p, ips, follow) == 1 && follow[0]);
+    assert(ap2_ptp_peers_release(&p, "192.0.2.1"));
+    assert(snapshot(&p, ips, follow) == 1 && !follow[0]);
+    assert(!ap2_ptp_peers_release(&p, "192.0.2.1"));
+    assert(!ap2_ptp_peers_release(&p, "not-an-ip"));
+}
+
 int main(void)
 {
     test_removed_registrations_free_their_slots();
@@ -111,6 +132,7 @@ int main(void)
     test_unowned_registrations_are_refcounted();
     test_reap_drops_only_dead_owners();
     test_follow_is_set_while_any_registration_follows();
+    test_release_only_touches_ownerless_registrations();
     printf("test_ap2_ptp_peers: all tests passed\n");
     return 0;
 }
