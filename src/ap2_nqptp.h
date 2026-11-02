@@ -2,13 +2,14 @@
  * AirPlay 2 PTP - NQPTP compatibility for the PTP daemon
  *
  * shairport-sync gets its sender's clock from nqptp, which needs UDP 319/320
- * like the daemon. This is nqptp's client interface (SMI version 11):
+ * like the daemon. The daemon can serve nqptp's client interface (SMI
+ * version 11) itself:
  *
- *   control  "<smi> T [<ip> ...]", "<smi> B|E|P", no reply.
+ *   control  "<smi> T [<ip> ...]", "<smi> B|E|P" to localhost:9000, no reply.
  *            T follows the first ip (none: nothing), B play, E stop, P pause.
- *   clock    shm object <smi> (struct ap2_nqptp_smi).
+ *   clock    shm object <smi> (struct ap2_nqptp_smi), created on first use.
  *
- * Parsing the control messages and filling the shm object, nothing more yet.
+ * The clocks come from the owner (struct ap2_nqptp_ops).
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -21,6 +22,10 @@
 #include <stdint.h>
 #include <netinet/in.h>
 
+#ifndef AP2_NQPTP_CTRL_PORT
+#define AP2_NQPTP_CTRL_PORT 9000
+#endif
+
 /* Linux POSIX shm directory (new objects are renamed into place here) */
 #ifndef AP2_NQPTP_SHM_DIR
 #define AP2_NQPTP_SHM_DIR "/dev/shm"
@@ -28,7 +33,10 @@
 
 #define AP2_NQPTP_SMI_VERSION   11
 #define AP2_NQPTP_NAME_MAX      63                /* including the leading "/" */
+#define AP2_NQPTP_MAX_CLIENTS   16
 #define AP2_NQPTP_MSG_MAX       4096
+#define AP2_NQPTP_STOP_GRACE_NS 2250000000ULL     /* E -> stop following */
+#define AP2_NQPTP_IDLE_REUSE_NS 60000000000ULL    /* idle slot reusable when full */
 
 /* Nanoseconds on the client's raw clock (CLOCK_MONOTONIC_RAW / CLOCK_UPTIME_RAW). */
 struct ap2_nqptp_smi_set {
@@ -55,6 +63,14 @@ struct ap2_nqptp_clock {
     uint64_t clock_id;
     int64_t offset_ns;     /* host ns -> master ns */
     uint64_t lock_ns;      /* host ns of its first offset sample */
+};
+
+struct ap2_nqptp_ops {
+    void *ud;
+    /* Start/stop following ip; each successful start gets exactly one stop. */
+    bool (*follow)(void *ud, struct in_addr ip, bool on);
+    /* The followed clock of ip; false until it has an offset. */
+    bool (*clock)(void *ud, struct in_addr ip, struct ap2_nqptp_clock *out);
 };
 
 enum ap2_nqptp_parse_result {
@@ -88,5 +104,46 @@ bool ap2_nqptp_name_valid(const char *name);
  * clock_offset_ns). Fills everything but clock_change_offset. */
 void ap2_nqptp_to_client_clock(const struct ap2_nqptp_clock *c, uint64_t host_now_ns,
                                int64_t clock_offset_ns, struct ap2_nqptp_smi_set *out);
+
+struct ap2_nqptp_client {
+    char name[AP2_NQPTP_NAME_MAX + 1];  /* "" = free */
+    struct ap2_nqptp_smi *map;
+    struct in_addr follow;              /* 0 = none */
+    bool following;                     /* registered with ops.follow */
+    bool playing;
+    uint64_t stopped_ns;
+    uint64_t seen_ns;
+    uint64_t last_clock_id;             /* last non-zero clock published */
+    uint64_t last_offset;
+    uint64_t change_offset;
+};
+
+struct ap2_nqptp {
+    int sock4, sock6;                   /* -1 when closed */
+    int64_t clock_offset_ns;
+    struct ap2_nqptp_ops ops;
+    struct ap2_nqptp_client c[AP2_NQPTP_MAX_CLIENTS];
+};
+
+/*
+ * Bind the control port on 127.0.0.1 and, if available, ::1.
+ *
+ * :returns: 0, EADDRINUSE (another nqptp), or another errno.
+ */
+int ap2_nqptp_open(struct ap2_nqptp *nq, const struct ap2_nqptp_ops *ops,
+                   int64_t clock_offset_ns);
+
+/* Read and act on one datagram from fd. */
+void ap2_nqptp_receive(struct ap2_nqptp *nq, int fd, uint64_t host_now_ns);
+
+/* Act on one parsed message (exposed for tests). */
+void ap2_nqptp_handle(struct ap2_nqptp *nq, const struct ap2_nqptp_msg *m,
+                      enum ap2_nqptp_parse_result pr, uint64_t host_now_ns);
+
+/* Expire stopped clients and publish every clock; call periodically. */
+void ap2_nqptp_tick(struct ap2_nqptp *nq, uint64_t host_now_ns);
+
+/* Publish "no clock", stop following, close. Objects stay for reattach. */
+void ap2_nqptp_close(struct ap2_nqptp *nq);
 
 #endif /* __AP2_NQPTP_H_ */

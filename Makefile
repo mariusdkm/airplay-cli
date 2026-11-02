@@ -332,7 +332,7 @@ $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_peers.
 
 $(NQPTP_TEST): tests/test_ap2_nqptp.c src/ap2_nqptp.c src/ap2_nqptp.h Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_nqptp.c \
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) -DAP2_NQPTP_CTRL_PORT=9013 tests/test_ap2_nqptp.c \
 		src/ap2_nqptp.c $(TOOLS)/cross_log.c $(LDFLAGS) -o $@
 
 $(PEERS_TEST): tests/test_ap2_ptp_peers.c src/ap2_ptp_peers.c src/ap2_ptp_peers.h \
