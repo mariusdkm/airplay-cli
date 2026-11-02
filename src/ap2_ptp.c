@@ -44,6 +44,7 @@
 #include "cross_log.h"
 #include "ap2_nqptp.h"
 #include "ap2_ptp.h"
+#include "ap2_ptp_offset.h"
 #include "ap2_ptp_peers.h"
 #include "ap2_ptp_shm.h"
 #include "host_clock.h"
@@ -114,15 +115,6 @@ extern log_level *loglevel;
 
 /* ---- BMCA / slave tuning ---- */
 
-/* Offset smoothing: fold each new local->master sample as an EMA with gain
- * 1/PTP_OFFSET_EMA_DIV, but SNAP straight to the sample when it steps by more
- * than PTP_OFFSET_SNAP_NS (first lock, or a clock reset) so we track rather
- * than crawl. The offset is dominated by userspace-timestamping jitter of a
- * few tens of microseconds, well under the SNAP threshold, so the EMA filters
- * that jitter while the SNAP catches genuine steps. */
-#define PTP_OFFSET_EMA_DIV     8
-#define PTP_OFFSET_SNAP_NS     1000000LL          /* 1 ms */
-
 /* Revert to grandmaster if the elected peer stops announcing for this long
  * (3x the 1 s announce interval, so a couple of dropped Announces don't flap). */
 #define PTP_PEER_SILENCE_NS    3000000000ULL      /* 3 s */
@@ -149,9 +141,8 @@ _Static_assert(PTP_MAX_FOLLOW == AP2_PTP_SHM_MAX_FOLLOW,
 struct ptp_follow {
     struct in_addr addr;            /* s_addr == 0: free slot */
     bool have_clock;                /* an Announce named its grandmaster */
-    bool have_offset;               /* >= 1 offset sample folded in */
     uint64_t clock_id;              /* its grandmasterIdentity (timeline id) */
-    int64_t offset_ns;              /* local -> its clock (add to local ns) */
+    struct ap2_ptp_offset offset;   /* local -> its clock */
     uint64_t lock_ns;               /* local ns of its first offset sample */
     uint64_t last_ns;               /* local ns of its last Announce/Sync */
     bool pending_sync_valid;        /* two-step Sync awaiting its Follow_Up */
@@ -230,8 +221,7 @@ struct ap2_ptp_ctx {
     bool unicast_granted;           /* a peer negotiated unicast PTP via Signaling */
     bool peer_kick;                 /* send timing immediately after peer registration */
     uint64_t master_clock_id;       /* elected GM identity (peer's grandmasterIdentity when slaving) */
-    int64_t master_offset_ns;       /* smoothed local->master offset (add to local for master time) */
-    bool have_offset;               /* at least one offset sample folded in */
+    struct ap2_ptp_offset master_offset; /* local -> master (add to local for master time) */
     bool have_peer;                 /* at least one peer Announce parsed */
     struct ptp_dataset best_peer;   /* most recent competing dataset */
     uint64_t last_peer_announce_ns; /* local ns of the most recent peer Announce (silence detect) */
@@ -755,23 +745,6 @@ static int ptp_dataset_compare(const struct ptp_dataset *a, const struct ptp_dat
     return 0;
 }
 
-/* Fold one local->master offset sample in: snap on a step, EMA on jitter. */
-static void ptp_apply_offset_sample(struct ap2_ptp_ctx *ctx, int64_t raw_offset)
-{
-    pthread_mutex_lock(&ctx->lock);
-    if (!ctx->have_offset) {
-        ctx->master_offset_ns = raw_offset;
-        ctx->have_offset = true;
-    } else {
-        int64_t delta = raw_offset - ctx->master_offset_ns;
-        if (delta > PTP_OFFSET_SNAP_NS || delta < -PTP_OFFSET_SNAP_NS)
-            ctx->master_offset_ns = raw_offset;
-        else
-            ctx->master_offset_ns += delta / PTP_OFFSET_EMA_DIV;
-    }
-    pthread_mutex_unlock(&ctx->lock);
-}
-
 /* ---- followed receivers ---- */
 
 /* Lock held. Return the follow slot for `addr`, creating one when the address
@@ -795,22 +768,6 @@ static struct ptp_follow *ptp_follow_slot(struct ap2_ptp_ctx *ctx, struct in_add
     return free_slot;
 }
 
-/* Lock held. Fold one local->peer offset sample into a follow slot (same
- * snap/EMA policy as the BMCA slave path). */
-static void ptp_follow_fold_offset(struct ptp_follow *f, int64_t raw_offset)
-{
-    if (!f->have_offset) {
-        f->offset_ns = raw_offset;
-        f->have_offset = true;
-        return;
-    }
-    int64_t delta = raw_offset - f->offset_ns;
-    if (delta > PTP_OFFSET_SNAP_NS || delta < -PTP_OFFSET_SNAP_NS)
-        f->offset_ns = raw_offset;
-    else
-        f->offset_ns += delta / PTP_OFFSET_EMA_DIV;
-}
-
 /* Announce from a followed receiver: record its grandmaster identity and
  * keep BMCA out of it (we stay grandmaster for everyone else). Returns true
  * when the sender is followed. */
@@ -824,7 +781,7 @@ static bool ptp_follow_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int
     bool first = !f->have_clock;
     if (ptp_parse_announce(buf, n, &peer)) {
         if (f->have_clock && f->clock_id != peer.grandmaster_identity) {
-            f->have_offset = false;       /* new timeline: re-acquire */
+            f->offset.valid = false;      /* new timeline: re-acquire */
             f->pending_sync_valid = false;
         }
         f->clock_id = peer.grandmaster_identity;
@@ -863,19 +820,21 @@ static bool ptp_follow_sync(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
             f->pending_sync_rx_ns = rx_ns;
             f->pending_sync_corr_ns = corr;
         } else {
-            bool had = f->have_offset;
-            ptp_follow_fold_offset(f, (int64_t)t1 + corr - (int64_t)rx_ns);
+            bool had = f->offset.valid;
+            ap2_ptp_offset_fold(&f->offset, (int64_t)t1 + corr - (int64_t)rx_ns, rx_ns);
             locked_now = !had;
         }
     } else if (f->pending_sync_valid && f->pending_sync_seq == seq) {
         f->pending_sync_valid = false;
-        bool had = f->have_offset;
-        ptp_follow_fold_offset(f, (int64_t)t1 + f->pending_sync_corr_ns + corr
-                                  - (int64_t)f->pending_sync_rx_ns);
+        bool had = f->offset.valid;
+        ap2_ptp_offset_fold(&f->offset,
+                            (int64_t)t1 + f->pending_sync_corr_ns + corr
+                                - (int64_t)f->pending_sync_rx_ns,
+                            f->pending_sync_rx_ns);
         locked_now = !had;
     }
     if (locked_now) f->lock_ns = rx_ns;
-    int64_t off = f->offset_ns;
+    int64_t off = f->offset.ns;
     uint64_t cid = f->clock_id;
     pthread_mutex_unlock(&ctx->lock);
     if (locked_now)
@@ -890,9 +849,9 @@ static bool ptp_follow_lookup(struct ap2_ptp_ctx *ctx, struct in_addr addr,
 {
     for (int i = 0; i < PTP_MAX_FOLLOW; i++) {
         struct ptp_follow *f = &ctx->follow[i];
-        if (f->addr.s_addr != addr.s_addr || !f->have_clock || !f->have_offset) continue;
+        if (f->addr.s_addr != addr.s_addr || !f->have_clock || !f->offset.valid) continue;
         if (clock_id) *clock_id = f->clock_id;
-        if (offset_ns) *offset_ns = f->offset_ns;
+        if (offset_ns) *offset_ns = f->offset.ns;
         return true;
     }
     return false;
@@ -906,9 +865,9 @@ bool ap2_ptp_follow_clock(struct ap2_ptp_ctx *ctx, struct in_addr addr, uint64_t
     pthread_mutex_lock(&ctx->lock);
     for (int i = 0; i < PTP_MAX_FOLLOW && !ok; i++) {
         const struct ptp_follow *f = &ctx->follow[i];
-        if (f->addr.s_addr != addr.s_addr || !f->have_clock || !f->have_offset) continue;
+        if (f->addr.s_addr != addr.s_addr || !f->have_clock || !f->offset.valid) continue;
         *clock_id = f->clock_id;
-        *offset_ns = f->offset_ns;
+        *offset_ns = f->offset.ns;
         *lock_ns = f->lock_ns;
         ok = true;
     }
@@ -994,7 +953,7 @@ static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int
     if (!now_gm && was_gm) {
         /* Just started slaving: drop any stale lock so the offset re-acquires
          * against the new master rather than smoothing from zero. */
-        ctx->have_offset = false;
+        ctx->master_offset.valid = false;
         ctx->pending_sync_valid = false;
     }
     pthread_mutex_unlock(&ctx->lock);
@@ -1040,7 +999,9 @@ static void ptp_handle_sync(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n, 
     }
     if (n < PTP_HDR_LEN + 10) return;
     uint64_t t1 = ptp_read_ts(buf + PTP_HDR_LEN);
-    ptp_apply_offset_sample(ctx, (int64_t)t1 + corr_ns - (int64_t)rx_ns);
+    pthread_mutex_lock(&ctx->lock);
+    ap2_ptp_offset_fold(&ctx->master_offset, (int64_t)t1 + corr_ns - (int64_t)rx_ns, rx_ns);
+    pthread_mutex_unlock(&ctx->lock);
     LOG_DEBUG("[PTP] slave offset (one-step) seq=%u t1=%" PRIu64 " t2=%" PRIu64,
               seq, t1, rx_ns);
 }
@@ -1067,7 +1028,9 @@ static void ptp_handle_follow_up(struct ap2_ptp_ctx *ctx, const uint8_t *buf, in
     if (!matched) return;
 
     int64_t offset = (int64_t)t1 + corr_sync + corr_fup - (int64_t)t2;
-    ptp_apply_offset_sample(ctx, offset);
+    pthread_mutex_lock(&ctx->lock);
+    ap2_ptp_offset_fold(&ctx->master_offset, offset, t2);
+    pthread_mutex_unlock(&ctx->lock);
     LOG_DEBUG("[PTP] slave offset seq=%u t1=%" PRIu64 " t2=%" PRIu64 " corr=%" PRId64
               " -> off=%" PRId64 "ns", seq, t1, t2, corr_sync + corr_fup, offset);
 }
@@ -1127,7 +1090,7 @@ static void *ptp_thread_func(void *arg)
             ctx->is_grandmaster = true;
             ctx->master_clock_id = ctx->clock_id;
             ctx->have_peer = false;
-            ctx->have_offset = false;
+            ctx->master_offset.valid = false;
             ctx->pending_sync_valid = false;
             reclaimed = true;
         }
@@ -1437,8 +1400,7 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
     if (device_ip && ctx->npeers == 0) ctx->peers[ctx->npeers++] = strdup(device_ip);
     ctx->is_grandmaster = true;
     ctx->master_clock_id = ctx->clock_id;
-    ctx->master_offset_ns = 0;
-    ctx->have_offset = false;
+    ctx->master_offset = (struct ap2_ptp_offset){0};
     ctx->have_peer = false;
     ctx->pending_sync_valid = false;
     pthread_mutex_unlock(&ctx->lock);
@@ -1510,7 +1472,7 @@ void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
         pthread_mutex_lock(&ctx->lock);
         /* A coherent decision: either a peer appeared and we out-ranked it, or
          * we are slaving to it and have locked at least one offset sample. */
-        bool decided = ctx->have_peer && (ctx->is_grandmaster || ctx->have_offset);
+        bool decided = ctx->have_peer && (ctx->is_grandmaster || ctx->master_offset.valid);
         pthread_mutex_unlock(&ctx->lock);
         if (decided) break;
         usleep(10000);   /* 10 ms poll */
@@ -1519,7 +1481,7 @@ void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
     pthread_mutex_lock(&ctx->lock);
     LOG_INFO("[PTP] BMCA settled: %s, timeline=%016" PRIx64 "%s",
              ctx->is_grandmaster ? "GRANDMASTER" : "SLAVE", ctx->master_clock_id,
-             (!ctx->is_grandmaster && ctx->have_offset) ? " (offset locked)" :
+             (!ctx->is_grandmaster && ctx->master_offset.valid) ? " (offset locked)" :
              (ctx->have_peer ? "" : " (no peer seen)"));
     pthread_mutex_unlock(&ctx->lock);
 }
@@ -1580,7 +1542,7 @@ uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx)
         return (uint64_t)((int64_t)local + off);
     }
     pthread_mutex_lock(&ctx->lock);
-    int64_t off = ctx->is_grandmaster ? 0 : ctx->master_offset_ns;
+    int64_t off = ctx->is_grandmaster ? 0 : ctx->master_offset.ns;
     pthread_mutex_unlock(&ctx->lock);
     return (uint64_t)((int64_t)local + off);
 }
@@ -1766,8 +1728,8 @@ static void daemon_fill_sample(struct ap2_ptp_ctx *ctx, uint64_t start_ns,
     pthread_mutex_lock(&ctx->lock);
     bool gm = ctx->is_grandmaster;
     uint64_t cid = gm ? ctx->clock_id : ctx->master_clock_id;
-    int64_t off = gm ? 0 : ctx->master_offset_ns;
-    bool locked = gm ? true : ctx->have_offset;
+    int64_t off = gm ? 0 : ctx->master_offset.ns;
+    bool locked = gm ? true : ctx->master_offset.valid;
     pthread_mutex_unlock(&ctx->lock);
 
     memset(out, 0, sizeof(*out));
@@ -1783,8 +1745,8 @@ static void daemon_fill_sample(struct ap2_ptp_ctx *ctx, uint64_t start_ns,
         if (!f->addr.s_addr || !f->have_clock) continue;
         out->follow[i].ip = f->addr.s_addr;
         out->follow[i].clock_id = f->clock_id;
-        out->follow[i].offset = f->offset_ns;
-        out->follow[i].flags = f->have_offset ? AP2_PTP_SHM_F_FOLLOW_LOCKED : 0u;
+        out->follow[i].offset = f->offset.ns;
+        out->follow[i].flags = f->offset.valid ? AP2_PTP_SHM_F_FOLLOW_LOCKED : 0u;
     }
     pthread_mutex_unlock(&ctx->lock);
 }
