@@ -14,9 +14,10 @@
  * A sample can also read too high, from a bad correction field, so one more
  * than AP2_PTP_OFFSET_JUMP_NS above the highest level taken so far waits for a
  * second sample that also reads that high, and the lower of the two is taken.
- * Climbing back from the estimate's own drift down needs no confirmation. A step back smaller than
- * AP2_PTP_OFFSET_STEP_NS is only followed at the drift rate; nqptp follows
- * those even slower (negative jitter clamped to 2.5 ms, weighted 1/256).
+ * Climbing back from the estimate's own drift down needs no confirmation.
+ * A step back smaller than AP2_PTP_OFFSET_STEP_NS is only followed at the
+ * drift rate; nqptp follows those even slower (negative jitter clamped to
+ * 2.5 ms, weighted 1/256).
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * SPDX-License-Identifier: Apache-2.0
